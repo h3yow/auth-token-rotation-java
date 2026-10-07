@@ -51,24 +51,28 @@ public class AuthService {
     }
 
     /**
-     * Atomically invalidate the presented refresh token and return a new pair.
-     * Concurrent or repeated use of the same refresh token fails with a
-     * distinguishable code and revokes the whole chain.
-     *
-     * <p>Synchronization model:
+     * Rotate a refresh token with a <b>scheduling-independent benign-concurrency
+     * verdict</b>. Every attempt performs one atomic <em>first touch</em> on the
+     * presented token <b>before any blocking</b>:
      * <ol>
-     *   <li>A per-family single-holder gate rejects every attempt that overlaps
-     *       another in-flight rotation for the same family. The winner enters
-     *       the family's exclusive lock; losers block on that lock.</li>
-     *   <li>Inside the lock, the winner rotates exactly once. When losers enter
-     *       after the winner, the token state and the still-open gate together
-     *       prove the overlap, so they are classified as a <em>concurrent</em>
-     *       replay. A later replay after the gate has closed is a
-     *       <em>sequential</em> replay.</li>
-     *   <li>Either replay verdict revokes the entire chain (session, all access
-     *       tokens via the family status, and all future refresh attempts),
-     *       while other families remain untouched.</li>
-     * </ol>
+     *   <li>The unique attempt that observes {@code ACTIVE} wins, claims the
+     *       token as {@code ROTATING} and performs exactly one rotation inside
+     *       the family's exclusive lock.</li>
+     *   <li>Attempts that observe {@code ROTATING}, or {@code ROTATED} within the
+     *       configurable overlap window, are members of the same concurrent
+     *       batch. They all receive the same distinguishable benign verdict
+     *       {@link AuthErrorCode#REFRESH_CONCURRENT_CONFLICT} (HTTP 409). The
+     *       chain is <b>not</b> harmed and the winner's freshly issued pair
+     *       stays usable for access and further rotation.</li>
+     *   <li>A reuse of the consumed token <b>after</b> the overlap window has
+     *       elapsed is a true post-hoc replay: the whole chain is terminated as
+     *       {@code COMPROMISED}, exactly as in the previous revision.</li>
+     * </ul>
+     *
+     * <p>The first touch depends only on the token's own state and wall-clock
+     * distance from the finished rotation, never on thread ordering, so no
+     * matter how a batch is scheduled or re-run there is always exactly one
+     * success and every loser lands on the same conclusion.
      */
     public TokenPair rotate(String presentedRefreshToken, String callerId) {
         long now = clock.nowMillis();
@@ -80,28 +84,45 @@ public class AuthService {
                     "refresh token not found");
         }
         String familyId = presented.getFamilyId();
-        Session session = store.findSession(familyId);
-        String attemptId = UUID.randomUUID().toString();
-        boolean gateAcquired = store.tryAcquireFamilyGate(familyId, attemptId);
+
+        // THE single classification point. Atomic, pre-blocking, and the only
+        // place the benign/malicious distinction is decided.
+        RefreshTokenRecord.FirstTouch firstTouch =
+                presented.firstTouch(now, properties.getRefreshConcurrentOverlapMillis());
+
+        return switch (firstTouch) {
+            case WINNER -> rotateAsWinner(presentedRefreshToken, presented, familyId, callerId);
+            case CONCURRENT -> handleConcurrentContender(presentedRefreshToken, presented, familyId, callerId);
+            case SEQUENTIAL_REPLAY -> handleSequentialReplay(presented, familyId, callerId);
+            case CHAIN_TERMINATED -> handleChainTerminated(presented, familyId, callerId);
+        };
+    }
+
+    private TokenPair rotateAsWinner(String presentedRefreshToken, RefreshTokenRecord presented,
+                                     String familyId, String callerId) {
         try {
             return store.withFamilyLock(familyId, fid -> {
-                long insideAt = clock.nowMillis();
+                long at = clock.nowMillis();
                 Session current = store.findSession(fid);
 
                 if (current != null && !callerId.equals(current.getCallerId())) {
+                    // Not a rotation at all: hand the still-valid token back so
+                    // its real owner is never harmed by a foreign attempt.
+                    presented.rollbackToActive();
                     logReject("refresh", AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, fid,
                             presented.getState().name(), "presented_caller_differs_from_chain_owner");
                     throw new AuthException(AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, fid,
                             presented.getState().name(), "caller does not own this refresh chain");
                 }
-
                 if (current != null && current.getStatus() == Session.Status.LOGGED_OUT) {
+                    presented.markRevoked();
                     logReject("refresh", AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
                             current.getStatus().name(), "session_status=LOGGED_OUT");
                     throw new AuthException(AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
                             current.getStatus().name(), "session has been logged out");
                 }
                 if (current != null && current.getStatus() == Session.Status.COMPROMISED) {
+                    presented.markRevoked();
                     logReject("refresh", AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
                             current.getStatus().name(), "session_status=COMPROMISED_due_to_replay");
                     throw new AuthException(AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
@@ -110,58 +131,152 @@ public class AuthService {
 
                 RefreshTokenRecord live = store.findRefreshToken(presentedRefreshToken);
                 if (live == null) {
+                    // Reclaimed mid-flight: release waiters with a plain unknown verdict.
+                    presented.rollbackToActive();
                     logReject("refresh", AuthErrorCode.REFRESH_TOKEN_UNKNOWN, callerId, fid, "UNKNOWN",
                             "refresh_token_disappeared_inside_lock");
                     throw new AuthException(AuthErrorCode.REFRESH_TOKEN_UNKNOWN, callerId, fid, "UNKNOWN",
                             "refresh token not found");
                 }
-
-                if (live.getState() != RefreshTokenRecord.State.ACTIVE) {
-                    // The token was already consumed. A still-open gate means the
-                    // consumption happened on an overlapping attempt (concurrent
-                    // replay); a closed gate means an attacker replayed it later.
-                    boolean concurrent = !gateAcquired;
-                    revokeChain(current, Session.Status.COMPROMISED, insideAt,
-                            concurrent ? "concurrent_refresh_token_replay" : "sequential_refresh_token_replay");
-                    AuthErrorCode code = concurrent
-                            ? AuthErrorCode.REFRESH_TOKEN_REPLAY_CONCURRENT
-                            : AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL;
-                    logReject("refresh", code, callerId, fid, live.getState().name(),
-                            concurrent ? "gate_still_open_and_token_already_" + live.getState()
-                                       : "gate_closed_token_already_" + live.getState());
-                    throw new AuthException(code, callerId, fid, live.getState().name(),
-                            concurrent ? "concurrent reuse of a refresh token detected"
-                                       : "replay of an already rotated refresh token detected");
-                }
-
-                if (live.getExpiresAtMillis() <= insideAt) {
+                if (live.getExpiresAtMillis() <= at) {
+                    // Expiry is a property of time, not of the claim: the token
+                    // is unusable for everyone, so no rollback, just revocation.
+                    live.markRevoked();
                     logReject("refresh", AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, fid,
                             live.getState().name(),
-                            "expiresAt=" + live.getExpiresAtMillis() + " now=" + insideAt);
+                            "expiresAt=" + live.getExpiresAtMillis() + " now=" + at);
                     throw new AuthException(AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, fid,
                             live.getState().name(), "refresh token expired");
                 }
 
                 // Exactly one attempt reaches this point per refresh token:
-                // the state flip and the issuance of the new pair are atomic.
-                if (!live.markRotated(insideAt)) {
-                    revokeChain(current, Session.Status.COMPROMISED, insideAt, "concurrent_refresh_token_replay");
-                    logReject("refresh", AuthErrorCode.REFRESH_TOKEN_REPLAY_CONCURRENT, callerId, fid,
-                            live.getState().name(), "lost_atomic_state_flip");
-                    throw new AuthException(AuthErrorCode.REFRESH_TOKEN_REPLAY_CONCURRENT, callerId, fid,
-                            live.getState().name(), "concurrent refresh lost the atomic rotation race");
-                }
-                TokenPair pair = issuePair(current, insideAt);
+                // state publication and issuance of the new pair are atomic.
+                TokenPair pair = issuePair(current, at);
+                live.completeRotation(at);
                 log.info("decision=refresh accepted=true callerId={} familyId={} refreshState=ROTATED "
-                                + "accessState=ISSUED basis=active_token_atomic_rotation attemptId={}",
-                        callerId, fid, attemptId);
+                                + "accessState=ISSUED basis=winner_first_touch_atomic_rotation",
+                        callerId, fid);
                 return pair;
             });
-        } finally {
-            // Winner releases after the lock is freed and losers have finished
-            // observing the open gate, so concurrent replay is never misclassified.
-            store.releaseFamilyGate(familyId, attemptId);
+        } catch (RuntimeException ex) {
+            // Defensive: if the in-lock action aborts without publishing a
+            // terminal state, never leave waiters stuck on ROTATING.
+            if (presented.getState() == RefreshTokenRecord.State.ROTATING) {
+                presented.rollbackToActive();
+            }
+            throw ex;
         }
+    }
+
+    private TokenPair handleConcurrentContender(String presentedRefreshToken, RefreshTokenRecord presented,
+                                                String familyId, String callerId) {
+        // A foreign caller riding a concurrent batch still cannot see or move
+        // the chain; that verdict is more specific than the conflict verdict.
+        Session session = store.findSession(familyId);
+        if (session != null && !callerId.equals(session.getCallerId())) {
+            logReject("refresh", AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, familyId,
+                    presented.getState().name(), "concurrent_presenter_differs_from_chain_owner");
+            throw new AuthException(AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, familyId,
+                    presented.getState().name(), "caller does not own this refresh chain");
+        }
+        long waitBound = Math.max(properties.getRefreshConcurrentOverlapMillis(), 1L);
+        boolean resolved;
+        try {
+            resolved = presented.awaitResolution(waitBound);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new AuthException(AuthErrorCode.REFRESH_INFLIGHT_TIMEOUT, callerId, familyId,
+                    presented.getState().name(), "interrupted while waiting for the in-flight rotation");
+        }
+        if (!resolved) {
+            logReject("refresh", AuthErrorCode.REFRESH_INFLIGHT_TIMEOUT, callerId, familyId,
+                    presented.getState().name(), "winner_still_inflight_after_overlap_bound");
+            throw new AuthException(AuthErrorCode.REFRESH_INFLIGHT_TIMEOUT, callerId, familyId,
+                    presented.getState().name(), "the in-flight rotation did not finish in time");
+        }
+
+        // The winner has published. Re-read terminal session state first.
+        Session after = store.findSession(familyId);
+        if (after != null && after.getStatus() == Session.Status.COMPROMISED) {
+            logReject("refresh", AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, familyId,
+                    after.getStatus().name(), "session_status=COMPROMISED_while_waiting");
+            throw new AuthException(AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, familyId,
+                    after.getStatus().name(), "refresh chain invalidated by replay detection");
+        }
+        if (after != null && after.getStatus() == Session.Status.LOGGED_OUT) {
+            logReject("refresh", AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, familyId,
+                    after.getStatus().name(), "session_status=LOGGED_OUT_while_waiting");
+            throw new AuthException(AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, familyId,
+                    after.getStatus().name(), "session has been logged out");
+        }
+        // Winner rolled back because it failed on a non-terminal condition
+        // (e.g. expiry, disappearance): reclassify by the current token state.
+        RefreshTokenRecord latest = store.findRefreshToken(presentedRefreshToken);
+        if (latest != null && latest.getState() == RefreshTokenRecord.State.ACTIVE) {
+            return rotate(presentedRefreshToken, callerId);
+        }
+        if (latest != null && latest.getState() == RefreshTokenRecord.State.REVOKED) {
+            long now = clock.nowMillis();
+            if (latest.getExpiresAtMillis() <= now) {
+                logReject("refresh", AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, familyId,
+                        latest.getState().name(), "winner_failed_due_to_expiry");
+                throw new AuthException(AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, familyId,
+                        latest.getState().name(), "refresh token expired");
+            }
+        }
+
+        // Benign concurrent conflict: same token presented by an overlapping
+        // attempt (or by a thread scheduled late but still inside the overlap
+        // window). No chain harm; the winner's pair remains fully usable.
+        String state = latest == null ? "UNKNOWN" : latest.getState().name();
+        logReject("refresh", AuthErrorCode.REFRESH_CONCURRENT_CONFLICT, callerId, familyId, state,
+                "duplicate_presentation_overlaps_finished_or_inflight_rotation_within_window_ms="
+                        + properties.getRefreshConcurrentOverlapMillis());
+        throw new AuthException(AuthErrorCode.REFRESH_CONCURRENT_CONFLICT, callerId, familyId, state,
+                "concurrent use of the same refresh token; exactly one attempt wins and the chain is preserved");
+    }
+
+    private TokenPair handleSequentialReplay(RefreshTokenRecord presented, String familyId, String callerId) {
+        long now = clock.nowMillis();
+        return store.withFamilyLock(familyId, fid -> {
+            Session current = store.findSession(fid);
+            if (current != null && current.getStatus() == Session.Status.COMPROMISED) {
+                logReject("refresh", AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
+                        current.getStatus().name(), "session_status=COMPROMISED_due_to_replay");
+                throw new AuthException(AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
+                        current.getStatus().name(), "refresh chain invalidated by replay detection");
+            }
+            if (current != null && current.getStatus() == Session.Status.LOGGED_OUT) {
+                logReject("refresh", AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
+                        current.getStatus().name(), "session_status=LOGGED_OUT");
+                throw new AuthException(AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
+                        current.getStatus().name(), "session has been logged out");
+            }
+            // The consumed token was re-presented strictly after the benign
+            // overlap window: a genuine post-hoc replay. The whole chain dies,
+            // including the pair that the legitimate rotation had issued.
+            revokeChain(current, Session.Status.COMPROMISED, now, "sequential_refresh_token_replay");
+            presented.markRevoked();
+            logReject("refresh", AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL, callerId, fid,
+                    presented.getState().name(),
+                    "token_already_" + presented.getState() + "_and_overlap_window_"
+                            + properties.getRefreshConcurrentOverlapMillis() + "ms_elapsed");
+            throw new AuthException(AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL, callerId, fid,
+                    presented.getState().name(),
+                    "replay of an already rotated refresh token after the concurrent overlap window");
+        });
+    }
+
+    private TokenPair handleChainTerminated(RefreshTokenRecord presented, String familyId, String callerId) {
+        Session current = store.findSession(familyId);
+        Session.Status status = current == null ? null : current.getStatus();
+        AuthErrorCode code = status == Session.Status.LOGGED_OUT
+                ? AuthErrorCode.CHAIN_REVOKED_LOGOUT
+                : AuthErrorCode.CHAIN_REVOKED_REPLAY;
+        logReject("refresh", code, callerId, familyId, presented.getState().name(),
+                "refresh_token_already_" + presented.getState());
+        throw new AuthException(code, callerId, familyId, presented.getState().name(),
+                "refresh chain already terminated");
     }
 
     /**
@@ -220,7 +335,14 @@ public class AuthService {
                     "no_authorization_header_token");
             return v;
         }
-        AccessTokenRecord record = store.findAccessToken(opaqueAccessToken);
+        // Token and session are read in one family-locked snapshot, so a
+        // concurrent rotation, logout or reclamation run can never make the two
+        // observations disagree. Session status is consulted on every call:
+        // revoking the family makes every unexpired access token fail
+        // immediately, no denylist delay.
+        TokenStore.AccessSnapshot snapshot = store.snapshotAccessToken(opaqueAccessToken);
+        AccessTokenRecord record = snapshot.access();
+        Session session = snapshot.session();
         if (record == null) {
             AccessVerification v = AccessVerification.rejected(
                     AuthErrorCode.ACCESS_TOKEN_UNKNOWN.code(), callerId, opaqueAccessToken, "UNKNOWN");
@@ -236,9 +358,6 @@ public class AuthService {
                     record.getFamilyId(), "ACTIVE", "presented_caller_differs_from_token_owner");
             return v;
         }
-        // Session status is consulted on every call: revoking the family makes
-        // every unexpired access token fail immediately, no denylist delay.
-        Session session = store.findSession(record.getFamilyId());
         if (session != null && session.getStatus() == Session.Status.LOGGED_OUT) {
             AccessVerification v = new AccessVerification(false,
                     AuthErrorCode.ACCESS_TOKEN_REVOKED_LOGOUT.code(), callerId, record.getSubject(),

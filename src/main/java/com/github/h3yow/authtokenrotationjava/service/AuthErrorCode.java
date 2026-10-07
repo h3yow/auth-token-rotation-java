@@ -19,9 +19,10 @@ public enum AuthErrorCode {
     REFRESH_TOKEN_EXPIRED("refresh_token_expired", 401),
     REFRESH_TOKEN_CALLER_MISMATCH("refresh_token_caller_mismatch", 401),
     REFRESH_TOKEN_REPLAY_SEQUENTIAL("refresh_token_replay_sequential", 401),
-    REFRESH_TOKEN_REPLAY_CONCURRENT("refresh_token_replay_concurrent", 401),
+    REFRESH_CONCURRENT_CONFLICT("refresh_concurrent_conflict", 409),
     CHAIN_REVOKED_LOGOUT("chain_revoked_logout", 401),
     CHAIN_REVOKED_REPLAY("chain_revoked_replay", 401),
+    REFRESH_INFLIGHT_TIMEOUT("refresh_inflight_timeout", 409),
 
     // rate limiting
     CALLER_IDENTITY_MISSING("caller_identity_missing", 400),

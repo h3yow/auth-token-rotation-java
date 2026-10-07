@@ -21,6 +21,15 @@ public class SecurityProperties {
     /** Length of the sliding rate-limit window in milliseconds. */
     private long rateLimitWindowMillis = 1000L;
 
+    /**
+     * Benign-concurrency overlap window in milliseconds. A duplicate
+     * presentation of a refresh token whose consumption finished no longer than
+     * this many milliseconds ago is still classified as a benign concurrent
+     * conflict (409) rather than a post-hoc sequential replay. A reuse after
+     * this window elapsed is a real sequential replay and kills the chain.
+     */
+    private long refreshConcurrentOverlapMillis = 2000L;
+
     public long getAccessTokenTtlMillis() {
         return accessTokenTtlMillis;
     }
@@ -51,5 +60,13 @@ public class SecurityProperties {
 
     public void setRateLimitWindowMillis(long rateLimitWindowMillis) {
         this.rateLimitWindowMillis = rateLimitWindowMillis;
+    }
+
+    public long getRefreshConcurrentOverlapMillis() {
+        return refreshConcurrentOverlapMillis;
+    }
+
+    public void setRefreshConcurrentOverlapMillis(long refreshConcurrentOverlapMillis) {
+        this.refreshConcurrentOverlapMillis = refreshConcurrentOverlapMillis;
     }
 }

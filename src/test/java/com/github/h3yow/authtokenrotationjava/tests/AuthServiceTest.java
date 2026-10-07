@@ -16,7 +16,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -67,6 +66,10 @@ class AuthServiceTest {
         TokenPair second = authService.rotate(first.refreshToken(), "caller-B");
         assertNotEquals(first.refreshToken(), second.refreshToken());
 
+        // A reuse only after the benign overlap window has elapsed is the real
+        // post-hoc replay that must kill the chain.
+        clock.advanceMillis(2_001);
+
         // Replay of the old (already rotated) token.
         AuthException replay = assertThrowsAuth(() -> authService.rotate(first.refreshToken(), "caller-B"));
         assertEquals(AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL, replay.getErrorCode());
@@ -83,7 +86,7 @@ class AuthServiceTest {
     }
 
     @Test
-    @DisplayName("concurrent use of one refresh token allows exactly one success")
+    @DisplayName("concurrent use of one refresh token: exactly one success, all losers get the same 409 conflict and the chain stays healthy")
     void concurrentRefreshExactlyOneSuccess() throws Exception {
         TokenPair pair = authService.login("carol", "caller-C");
         int threads = 16;
@@ -91,11 +94,10 @@ class AuthServiceTest {
         CountDownLatch ready = new CountDownLatch(threads);
         CountDownLatch start = new CountDownLatch(1);
         AtomicInteger success = new AtomicInteger();
-        AtomicInteger sequentialReplay = new AtomicInteger();
-        AtomicInteger concurrentReplay = new AtomicInteger();
-        AtomicInteger chainRevoked = new AtomicInteger();
+        AtomicInteger conflict = new AtomicInteger();
         AtomicInteger otherErrors = new AtomicInteger();
         java.util.List<String> otherReasons = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+        java.util.List<TokenPair> winningPairs = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
         for (int i = 0; i < threads; i++) {
             pool.submit(() -> {
@@ -104,26 +106,18 @@ class AuthServiceTest {
                     start.await();
                     try {
                         TokenPair rotated = authService.rotate(pair.refreshToken(), "caller-C");
-                        if (!rotated.accessToken().isBlank()) {
-                            success.incrementAndGet();
-                        }
+                        winningPairs.add(rotated);
+                        success.incrementAndGet();
                     } catch (AuthException ex) {
-                        // A batch-released thread may be scheduled into rotate()
-                        // after the winner's gate has already closed; it then
-                        // genuinely arrives later and is classified SEQUENTIAL.
-                        // Threads that overlap the winner are CONCURRENT, and
-                        // threads arriving after the first loser are CHAIN_*.
-                        // All three are distinguishable replay-family verdicts;
-                        // the deterministic guarantees are "exactly one success",
-                        // "no other reason" and "the whole chain is compromised".
-                        switch (ex.getErrorCode()) {
-                            case REFRESH_TOKEN_REPLAY_CONCURRENT -> concurrentReplay.incrementAndGet();
-                            case REFRESH_TOKEN_REPLAY_SEQUENTIAL -> sequentialReplay.incrementAndGet();
-                            case CHAIN_REVOKED_REPLAY -> chainRevoked.incrementAndGet();
-                            default -> {
-                                otherErrors.incrementAndGet();
-                                otherReasons.add(ex.getErrorCode().name());
-                            }
+                        // Under the scheduling-independent first-touch protocol
+                        // every losing attempt of the same concurrent batch must
+                        // land on exactly one benign verdict, regardless of how
+                        // late the OS schedules the thread.
+                        if (ex.getErrorCode() == AuthErrorCode.REFRESH_CONCURRENT_CONFLICT) {
+                            conflict.incrementAndGet();
+                        } else {
+                            otherErrors.incrementAndGet();
+                            otherReasons.add(ex.getErrorCode().name());
                         }
                     }
                 } catch (InterruptedException ie) {
@@ -137,50 +131,115 @@ class AuthServiceTest {
         pool.shutdown();
         assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "all refresh attempts must finish");
 
-        int replayFailures = sequentialReplay.get() + concurrentReplay.get() + chainRevoked.get();
-        System.out.printf("[concurrent-refresh] callerId=caller-C threads=%d success=%d sequentialReplay=%d "
-                        + "concurrentReplay=%d chainRevoked=%d other=%d otherReasons=%s%n",
-                threads, success.get(), sequentialReplay.get(), concurrentReplay.get(),
-                chainRevoked.get(), otherErrors.get(), otherReasons);
+        System.out.printf("[concurrent-refresh] callerId=caller-C threads=%d success=%d conflict=%d "
+                        + "other=%d otherReasons=%s%n",
+                threads, success.get(), conflict.get(), otherErrors.get(), otherReasons);
 
         assertEquals(1, success.get(), "exactly one concurrent refresh may succeed");
+        assertEquals(threads - 1, conflict.get(),
+                "every losing attempt must get the same benign concurrent-conflict verdict");
         assertEquals(0, otherErrors.get(),
                 "no unexplained failures allowed, got: " + otherReasons);
-        assertEquals(threads - 1, replayFailures,
-                "every losing attempt must be a distinguishable replay/chain conclusion");
 
-        // The winning pair must also be unusable afterwards: the chain was
-        // compromised by the concurrent duplicate presentation.
-        for (Session session : allSessions()) {
-            assertEquals(Session.Status.COMPROMISED, session.getStatus());
+        // Benign concurrency must not harm the chain: the session stays ACTIVE.
+        Session session = store.findSession(pair.familyId());
+        assertEquals(Session.Status.ACTIVE, session.getStatus(),
+                "a benign concurrent batch must never invalidate the chain");
+
+        // The winner's freshly issued pair must still work: new access token
+        // verifies, and the new refresh token rotates again.
+        assertEquals(1, winningPairs.size());
+        TokenPair winnerPair = winningPairs.get(0);
+        AccessVerification winnerAccess =
+                authService.verifyAccessToken(winnerPair.accessToken(), "caller-C");
+        assertTrue(winnerAccess.accepted(), "winner's new access token must remain usable");
+        TokenPair next = authService.rotate(winnerPair.refreshToken(), "caller-C");
+        AccessVerification nextAccess = authService.verifyAccessToken(next.accessToken(), "caller-C");
+        assertTrue(nextAccess.accepted(), "the chain must continue rotating after a benign conflict");
+    }
+
+    @Test
+    @DisplayName("re-running a concurrent batch always yields the same verdict multiset: 1 success + N conflicts")
+    void concurrentBatchVerdictIsStableAcrossRuns() throws Exception {
+        for (int run = 0; run < 5; run++) {
+            TokenPair pair = authService.login("carol-run-" + run, "caller-C");
+            int threads = 12;
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            CountDownLatch ready = new CountDownLatch(threads);
+            CountDownLatch start = new CountDownLatch(1);
+            AtomicInteger success = new AtomicInteger();
+            AtomicInteger conflict = new AtomicInteger();
+            AtomicInteger other = new AtomicInteger();
+
+            for (int i = 0; i < threads; i++) {
+                pool.submit(() -> {
+                    try {
+                        ready.countDown();
+                        start.await();
+                        try {
+                            authService.rotate(pair.refreshToken(), "caller-C");
+                            success.incrementAndGet();
+                        } catch (AuthException ex) {
+                            if (ex.getErrorCode() == AuthErrorCode.REFRESH_CONCURRENT_CONFLICT) {
+                                conflict.incrementAndGet();
+                            } else {
+                                other.incrementAndGet();
+                            }
+                        }
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException(ie);
+                    }
+                });
+            }
+            ready.await();
+            start.countDown();
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+            System.out.printf("[concurrent-refresh-rerun] run=%d callerId=caller-C success=%d conflict=%d other=%d%n",
+                    run, success.get(), conflict.get(), other.get());
+            assertEquals(1, success.get(), "run " + run + ": exactly one success");
+            assertEquals(threads - 1, conflict.get(), "run " + run + ": every loser is the same conflict");
+            assertEquals(0, other.get(), "run " + run + ": no other verdict may appear");
+            assertEquals(Session.Status.ACTIVE, store.findSession(pair.familyId()).getStatus(),
+                    "run " + run + ": chain must survive");
         }
     }
 
     @Test
-    @DisplayName("concurrent replay classification is deterministic when the gate is open")
-    void heldGateProducesConcurrentVerdict() {
+    @DisplayName("a duplicate presentation inside the overlap window is a benign conflict, not a replay")
+    void withinOverlapWindowIsConcurrentConflict() {
         TokenPair pair = authService.login("dave", "caller-D");
         String familyId = pair.familyId();
 
-        // Reproduce the exact state a losing thread sees: the winner has
-        // consumed the token and the gate has not closed yet. We obtain that
-        // state from inside the family lock while holding the gate on a
-        // different attempt id, which is the definition of overlap.
-        String loserAttempt = UUID.randomUUID().toString();
-        assertTrue(store.tryAcquireFamilyGate(familyId, loserAttempt));
-        try {
-            RefreshTokenRecord record = store.findRefreshToken(pair.refreshToken());
-            assertTrue(record.markRotated(clock.nowMillis()), "winner consumes the token once");
-            // The loser arrives now: gate open (it lost acquisition), token ROTATED.
-            AuthException ex = assertThrowsAuth(() -> authService.rotate(pair.refreshToken(), "caller-D"));
-            assertEquals(AuthErrorCode.REFRESH_TOKEN_REPLAY_CONCURRENT, ex.getErrorCode());
-        } finally {
-            store.releaseFamilyGate(familyId, loserAttempt);
-        }
+        // Reproduce the exact state a late-but-overlapping loser observes: drive
+        // the token through the same claim/publication protocol a winner uses,
+        // with the rotation finishing "now" (inside the default 2000ms window).
+        RefreshTokenRecord record = store.findRefreshToken(pair.refreshToken());
+        assertEquals(RefreshTokenRecord.FirstTouch.WINNER,
+                record.firstTouch(clock.nowMillis(), 2_000L), "the winner claims the token once");
+        record.completeRotation(clock.nowMillis());
 
-        // Once the overlap is detected, the whole chain is compromised.
-        Session session = store.findSession(familyId);
-        assertEquals(Session.Status.COMPROMISED, session.getStatus());
+        AuthException ex = assertThrowsAuth(() -> authService.rotate(pair.refreshToken(), "caller-D"));
+        assertEquals(AuthErrorCode.REFRESH_CONCURRENT_CONFLICT, ex.getErrorCode());
+        assertEquals(Session.Status.ACTIVE, store.findSession(familyId).getStatus(),
+                "a conflict inside the overlap window must leave the chain alive");
+    }
+
+    @Test
+    @DisplayName("once the overlap window elapses, the same duplicate is a sequential replay that kills the chain")
+    void afterOverlapWindowDuplicateIsSequentialReplay() {
+        TokenPair pair = authService.login("dave2", "caller-D");
+        String familyId = pair.familyId();
+        RefreshTokenRecord record = store.findRefreshToken(pair.refreshToken());
+        record.firstTouch(clock.nowMillis(), 2_000L);
+        record.completeRotation(clock.nowMillis());
+
+        clock.advanceMillis(2_001);
+        AuthException ex = assertThrowsAuth(() -> authService.rotate(pair.refreshToken(), "caller-D"));
+        assertEquals(AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL, ex.getErrorCode());
+        assertEquals(Session.Status.COMPROMISED, store.findSession(familyId).getStatus(),
+                "a post-window reuse is the real replay that terminates the chain");
     }
 
     @Test
@@ -242,11 +301,5 @@ class AuthServiceTest {
             return ex;
         }
         throw new AssertionError("expected AuthException");
-    }
-
-    private java.util.List<Session> allSessions() {
-        java.util.List<Session> sessions = new java.util.ArrayList<>();
-        store.forEachSession(sessions::add);
-        return sessions;
     }
 }

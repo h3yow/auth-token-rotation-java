@@ -4,7 +4,6 @@ import com.github.h3yow.authtokenrotationjava.domain.AccessTokenRecord;
 import com.github.h3yow.authtokenrotationjava.domain.RefreshTokenRecord;
 import com.github.h3yow.authtokenrotationjava.domain.Session;
 
-import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
@@ -26,18 +25,33 @@ public interface TokenStore {
     AccessTokenRecord findAccessToken(String opaqueToken);
 
     /**
-     * Attempt to acquire the single-attempt gate for a family. Returns
-     * {@code true} for exactly one concurrent caller; a second concurrent
-     * caller receives {@code false} without blocking. The gate is released by
-     * the holder in {@link #releaseFamilyGate}.
+     * Token and owning-session snapshot taken atomically while holding the
+     * family lock, so concurrent rotation/logout/reclaim can never make the two
+     * observations disagree. Both elements may be {@code null} when absent.
      */
-    boolean tryAcquireFamilyGate(String familyId, String attemptId);
+    record AccessSnapshot(AccessTokenRecord access, Session session) {
+    }
 
-    void releaseFamilyGate(String familyId, String attemptId);
+    /**
+     * Read an access token together with the session of its family inside the
+     * family lock. Never returns {@code null}; members may be individually null.
+     */
+    AccessSnapshot snapshotAccessToken(String opaqueToken);
+
+    /** Remove a single stored record; used by safe reclamation. */
+    void removeSession(String familyId);
+
+    void removeRefreshToken(String opaqueToken);
+
+    void removeAccessToken(String opaqueToken);
+
+    /** Snapshot all stored ids/records (used by safe reclamation). */
+    java.util.List<java.util.Map.Entry<String, Session>> allSessions();
+
+    java.util.List<java.util.Map.Entry<String, RefreshTokenRecord>> allRefreshTokens();
+
+    java.util.List<java.util.Map.Entry<String, AccessTokenRecord>> allAccessTokens();
 
     /** Run an action while holding the family's exclusive lock. */
     <T> T withFamilyLock(String familyId, Function<String, T> action);
-
-    /** Invoke the consumer once per stored session (used by tests/ops). */
-    void forEachSession(Consumer<Session> consumer);
 }
