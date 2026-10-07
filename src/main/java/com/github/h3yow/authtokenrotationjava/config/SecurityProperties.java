@@ -21,6 +21,14 @@ public class SecurityProperties {
     /** Length of the sliding rate-limit window in milliseconds. */
     private long rateLimitWindowMillis = 1000L;
 
+    /**
+     * Grace window after a successful rotation during which a reuse of the
+     * consumed refresh token is classified as a benign concurrent conflict
+     * (HTTP 409) instead of a sequential replay. This makes the verdict for a
+     * batch of concurrent retries independent of thread scheduling.
+     */
+    private long refreshConcurrentGraceMillis = 30_000L;
+
     public long getAccessTokenTtlMillis() {
         return accessTokenTtlMillis;
     }
@@ -51,5 +59,13 @@ public class SecurityProperties {
 
     public void setRateLimitWindowMillis(long rateLimitWindowMillis) {
         this.rateLimitWindowMillis = rateLimitWindowMillis;
+    }
+
+    public long getRefreshConcurrentGraceMillis() {
+        return refreshConcurrentGraceMillis;
+    }
+
+    public void setRefreshConcurrentGraceMillis(long refreshConcurrentGraceMillis) {
+        this.refreshConcurrentGraceMillis = refreshConcurrentGraceMillis;
     }
 }

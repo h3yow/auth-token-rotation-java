@@ -87,7 +87,9 @@ class AuthHttpIntegrationTest {
         // New access token works.
         assertEquals("ok", resource(caller, rotated.get("accessToken").asText()).getBody().get("status").asText());
 
-        // Old refresh token replayed after a normal rotation: sequential replay, chain killed.
+        // Old refresh token replayed after a normal rotation and outside the
+        // benign-concurrency grace window: sequential replay, chain killed.
+        clock.advanceMillis(30_001);
         ResponseEntity<JsonNode> replay = post("/api/auth/refresh", caller, Map.of("refreshToken", refreshToken));
         assertEquals(HttpStatus.UNAUTHORIZED, replay.getStatusCode());
         assertEquals("refresh_token_replay_sequential", replay.getBody().get("error").asText());
@@ -100,7 +102,7 @@ class AuthHttpIntegrationTest {
 
     @Test
     @Order(2)
-    @DisplayName("concurrent refresh of the same token over HTTP: exactly one 200, rest distinguishable 401s")
+    @DisplayName("concurrent refresh of the same token over HTTP: exactly one 200, all others the same 409, chain survives")
     void concurrentRefreshOverHttp() throws Exception {
         String caller = "http-bob";
         JsonNode login = post("/api/auth/login", caller, Map.of("subject", "bob")).getBody();
@@ -111,10 +113,9 @@ class AuthHttpIntegrationTest {
         CountDownLatch ready = new CountDownLatch(threads);
         CountDownLatch start = new CountDownLatch(1);
         AtomicInteger ok = new AtomicInteger();
-        AtomicInteger sequentialReplay = new AtomicInteger();
-        AtomicInteger concurrentReplay = new AtomicInteger();
-        AtomicInteger chainRevoked = new AtomicInteger();
+        AtomicInteger conflict = new AtomicInteger();
         AtomicInteger unexpected = new AtomicInteger();
+        java.util.List<JsonNode> winningBodies = java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
         for (int i = 0; i < threads; i++) {
             pool.submit(() -> {
@@ -125,19 +126,16 @@ class AuthHttpIntegrationTest {
                             Map.of("refreshToken", refreshToken));
                     if (response.getStatusCode() == HttpStatus.OK) {
                         ok.incrementAndGet();
+                        winningBodies.add(response.getBody());
                     } else {
                         String error = response.getBody().get("error").asText();
-                        // Over real HTTP the server threads interleave behind a
-                        // bounded request pool, so a loser may observe the gate
-                        // either open (concurrent verdict) or already closed
-                        // (sequential verdict). Both are replay-family codes,
-                        // both kill the chain; what must be deterministic is:
-                        // exactly one success and zero unexplained failures.
-                        switch (error) {
-                            case "refresh_token_replay_concurrent" -> concurrentReplay.incrementAndGet();
-                            case "refresh_token_replay_sequential" -> sequentialReplay.incrementAndGet();
-                            case "chain_revoked_replay" -> chainRevoked.incrementAndGet();
-                            default -> unexpected.incrementAndGet();
+                        // Benign concurrent conflict: independent of how the
+                        // server threads were scheduled, every loser gets this
+                        // one distinguishable 409, and the chain is NOT killed.
+                        if ("refresh_conflict_concurrent".equals(error)) {
+                            conflict.incrementAndGet();
+                        } else {
+                            unexpected.incrementAndGet();
                         }
                     }
                 } catch (InterruptedException e) {
@@ -150,23 +148,27 @@ class AuthHttpIntegrationTest {
         pool.shutdown();
         assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
 
-        int replayFailures = sequentialReplay.get() + concurrentReplay.get() + chainRevoked.get();
-        System.out.printf("[http-concurrent-refresh] callerId=%s total=%d ok=%d sequentialReplay=%d "
-                        + "concurrentReplay=%d chainRevoked=%d unexpected=%d%n", caller, threads, ok.get(),
-                sequentialReplay.get(), concurrentReplay.get(), chainRevoked.get(), unexpected.get());
+        System.out.printf("[http-concurrent-refresh] callerId=%s total=%d ok=%d conflict409=%d unexpected=%d%n",
+                caller, threads, ok.get(), conflict.get(), unexpected.get());
         assertEquals(1, ok.get(), "exactly one concurrent refresh succeeds");
-        assertEquals(0, unexpected.get(), "all failures must have a distinguishable replay/chain reason");
-        assertEquals(threads - 1, replayFailures);
+        assertEquals(threads - 1, conflict.get(), "every loser must receive the same conflict verdict");
+        assertEquals(0, unexpected.get(), "no unexplained failure possible");
 
-        // Whatever the interleaving was, the chain must be COMPROMISED in the
-        // end: even the winner's fresh tokens are unusable afterwards.
-        ResponseEntity<JsonNode> afterAll = post("/api/auth/refresh", caller,
-                Map.of("refreshToken", login.get("refreshToken").asText()));
-        assertTrue(afterAll.getStatusCode() == HttpStatus.UNAUTHORIZED
-                        && (afterAll.getBody().get("error").asText().equals("refresh_token_replay_sequential")
-                        || afterAll.getBody().get("error").asText().equals("refresh_token_replay_concurrent")
-                        || afterAll.getBody().get("error").asText().equals("chain_revoked_replay")),
-                "the whole chain must be invalid after concurrent duplicate use");
+        // The winning new credentials remain usable: access works and the chain
+        // can rotate again.
+        JsonNode winner = winningBodies.get(0);
+        assertEquals(HttpStatus.OK, resource(caller, winner.get("accessToken").asText()).getStatusCode(),
+                "winner access token stays valid after benign concurrency");
+        ResponseEntity<JsonNode> continued = post("/api/auth/refresh", caller,
+                Map.of("refreshToken", winner.get("refreshToken").asText()));
+        assertEquals(HttpStatus.OK, continued.getStatusCode(), "winner refresh token can rotate again");
+
+        // The genuinely-post-round replay (grace elapsed) still kills the chain.
+        clock.advanceMillis(30_001);
+        ResponseEntity<JsonNode> lateReplay = post("/api/auth/refresh", caller,
+                Map.of("refreshToken", refreshToken));
+        assertEquals(HttpStatus.UNAUTHORIZED, lateReplay.getStatusCode());
+        assertEquals("refresh_token_replay_sequential", lateReplay.getBody().get("error").asText());
     }
 
     @Test
@@ -203,11 +205,13 @@ class AuthHttpIntegrationTest {
         assertEquals(HttpStatus.BAD_REQUEST, missing.getStatusCode());
         assertEquals("caller_identity_missing", missing.getBody().get("error").asText());
 
-        // Token minted for one caller, presented by another -> distinct 401.
+        // Token minted for one caller, presented by another: the server proves
+        // the real owner from the credential itself and rejects the forgery at
+        // the trust boundary, before any owner quota is consumed.
         JsonNode login = post("/api/auth/login", "http-frank", Map.of("subject", "frank")).getBody();
         ResponseEntity<JsonNode> foreign = resource("http-grace", login.get("accessToken").asText());
         assertEquals(HttpStatus.UNAUTHORIZED, foreign.getStatusCode());
-        assertEquals("access_token_caller_mismatch", foreign.getBody().get("error").asText());
+        assertEquals("caller_identity_untrusted", foreign.getBody().get("error").asText());
     }
 
     private ResponseEntity<JsonNode> post(String path, String callerId, Map<String, String> body) {

@@ -52,26 +52,28 @@ public class AuthService {
 
     /**
      * Atomically invalidate the presented refresh token and return a new pair.
-     * Concurrent or repeated use of the same refresh token fails with a
-     * distinguishable code and revokes the whole chain.
      *
-     * <p>Synchronization model:
+     * <p>All attempts for one family are serialized by the family's exclusive
+     * lock. When the presented token has already been consumed, the verdict no
+     * longer depends on <em>when</em> the losing thread happened to be
+     * scheduled. It is derived from durable state instead:
      * <ol>
-     *   <li>A per-family single-holder gate rejects every attempt that overlaps
-     *       another in-flight rotation for the same family. The winner enters
-     *       the family's exclusive lock; losers block on that lock.</li>
-     *   <li>Inside the lock, the winner rotates exactly once. When losers enter
-     *       after the winner, the token state and the still-open gate together
-     *       prove the overlap, so they are classified as a <em>concurrent</em>
-     *       replay. A later replay after the gate has closed is a
-     *       <em>sequential</em> replay.</li>
-     *   <li>Either replay verdict revokes the entire chain (session, all access
-     *       tokens via the family status, and all future refresh attempts),
-     *       while other families remain untouched.</li>
+     *   <li>The consumed token remembers its successor (the refresh token
+     *       issued by the winning rotation).</li>
+     *   <li>If the reuse lands within the configured grace window of the
+     *       rotation and the successor is still {@code ACTIVE}, it is a
+     *       <b>benign concurrent conflict</b>: {@code refresh_conflict_concurrent}.
+     *       The session is left untouched, so the winner's new pair keeps
+     *       working and can rotate again. Every request in a concurrently
+     *       fired batch gets this same verdict regardless of thread
+     *       scheduling, and the conclusion is stable across re-runs.</li>
+     *   <li>If the reuse arrives after the grace window has fully elapsed, or
+     *       the successor itself has already been consumed, the old token is a
+     *       genuine <b>sequential replay</b> after the rotation round ended:
+     *       the whole chain is revoked while other families stay untouched.</li>
      * </ol>
      */
     public TokenPair rotate(String presentedRefreshToken, String callerId) {
-        long now = clock.nowMillis();
         RefreshTokenRecord presented = store.findRefreshToken(presentedRefreshToken);
         if (presented == null) {
             logReject("refresh", AuthErrorCode.REFRESH_TOKEN_UNKNOWN, callerId, null, "UNKNOWN",
@@ -80,88 +82,113 @@ public class AuthService {
                     "refresh token not found");
         }
         String familyId = presented.getFamilyId();
-        Session session = store.findSession(familyId);
-        String attemptId = UUID.randomUUID().toString();
-        boolean gateAcquired = store.tryAcquireFamilyGate(familyId, attemptId);
-        try {
-            return store.withFamilyLock(familyId, fid -> {
-                long insideAt = clock.nowMillis();
-                Session current = store.findSession(fid);
+        return store.withFamilyLock(familyId, fid -> {
+            long insideAt = clock.nowMillis();
+            Session current = store.findSession(fid);
 
-                if (current != null && !callerId.equals(current.getCallerId())) {
-                    logReject("refresh", AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, fid,
-                            presented.getState().name(), "presented_caller_differs_from_chain_owner");
-                    throw new AuthException(AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, fid,
-                            presented.getState().name(), "caller does not own this refresh chain");
-                }
+            if (current != null && !callerId.equals(current.getCallerId())) {
+                logReject("refresh", AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, fid,
+                        presented.getState().name(), "presented_caller_differs_from_chain_owner");
+                throw new AuthException(AuthErrorCode.REFRESH_TOKEN_CALLER_MISMATCH, callerId, fid,
+                        presented.getState().name(), "caller does not own this refresh chain");
+            }
 
-                if (current != null && current.getStatus() == Session.Status.LOGGED_OUT) {
-                    logReject("refresh", AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
-                            current.getStatus().name(), "session_status=LOGGED_OUT");
-                    throw new AuthException(AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
-                            current.getStatus().name(), "session has been logged out");
-                }
-                if (current != null && current.getStatus() == Session.Status.COMPROMISED) {
-                    logReject("refresh", AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
-                            current.getStatus().name(), "session_status=COMPROMISED_due_to_replay");
-                    throw new AuthException(AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
-                            current.getStatus().name(), "refresh chain invalidated by replay detection");
-                }
+            if (current != null && current.getStatus() == Session.Status.LOGGED_OUT) {
+                logReject("refresh", AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
+                        current.getStatus().name(), "session_status=LOGGED_OUT");
+                throw new AuthException(AuthErrorCode.CHAIN_REVOKED_LOGOUT, callerId, fid,
+                        current.getStatus().name(), "session has been logged out");
+            }
+            if (current != null && current.getStatus() == Session.Status.COMPROMISED) {
+                logReject("refresh", AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
+                        current.getStatus().name(), "session_status=COMPROMISED_due_to_replay");
+                throw new AuthException(AuthErrorCode.CHAIN_REVOKED_REPLAY, callerId, fid,
+                        current.getStatus().name(), "refresh chain invalidated by replay detection");
+            }
 
-                RefreshTokenRecord live = store.findRefreshToken(presentedRefreshToken);
-                if (live == null) {
-                    logReject("refresh", AuthErrorCode.REFRESH_TOKEN_UNKNOWN, callerId, fid, "UNKNOWN",
-                            "refresh_token_disappeared_inside_lock");
-                    throw new AuthException(AuthErrorCode.REFRESH_TOKEN_UNKNOWN, callerId, fid, "UNKNOWN",
-                            "refresh token not found");
-                }
+            RefreshTokenRecord live = store.findRefreshToken(presentedRefreshToken);
+            if (live == null) {
+                logReject("refresh", AuthErrorCode.REFRESH_TOKEN_UNKNOWN, callerId, fid, "UNKNOWN",
+                        "refresh_token_disappeared_inside_lock");
+                throw new AuthException(AuthErrorCode.REFRESH_TOKEN_UNKNOWN, callerId, fid, "UNKNOWN",
+                        "refresh token not found");
+            }
 
-                if (live.getState() != RefreshTokenRecord.State.ACTIVE) {
-                    // The token was already consumed. A still-open gate means the
-                    // consumption happened on an overlapping attempt (concurrent
-                    // replay); a closed gate means an attacker replayed it later.
-                    boolean concurrent = !gateAcquired;
-                    revokeChain(current, Session.Status.COMPROMISED, insideAt,
-                            concurrent ? "concurrent_refresh_token_replay" : "sequential_refresh_token_replay");
-                    AuthErrorCode code = concurrent
-                            ? AuthErrorCode.REFRESH_TOKEN_REPLAY_CONCURRENT
-                            : AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL;
-                    logReject("refresh", code, callerId, fid, live.getState().name(),
-                            concurrent ? "gate_still_open_and_token_already_" + live.getState()
-                                       : "gate_closed_token_already_" + live.getState());
-                    throw new AuthException(code, callerId, fid, live.getState().name(),
-                            concurrent ? "concurrent reuse of a refresh token detected"
-                                       : "replay of an already rotated refresh token detected");
-                }
-
-                if (live.getExpiresAtMillis() <= insideAt) {
-                    logReject("refresh", AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, fid,
+            if (live.getState() != RefreshTokenRecord.State.ACTIVE) {
+                ConflictClassification classification = classifyReuse(live, insideAt);
+                if (classification.benign()) {
+                    logReject("refresh", AuthErrorCode.REFRESH_CONFLICT_CONCURRENT, callerId, fid,
+                            live.getState().name(), classification.basis());
+                    throw new AuthException(AuthErrorCode.REFRESH_CONFLICT_CONCURRENT, callerId, fid,
                             live.getState().name(),
-                            "expiresAt=" + live.getExpiresAtMillis() + " now=" + insideAt);
-                    throw new AuthException(AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, fid,
-                            live.getState().name(), "refresh token expired");
+                            "concurrent refresh conflict: another in-batch attempt already rotated "
+                                    + "this token; the winning new credentials remain valid");
                 }
+                revokeChain(current, Session.Status.COMPROMISED, insideAt,
+                        "sequential_refresh_token_replay");
+                logReject("refresh", AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL, callerId, fid,
+                        live.getState().name(), classification.basis());
+                throw new AuthException(AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL, callerId, fid,
+                        live.getState().name(), "replay of an already rotated refresh token detected");
+            }
 
-                // Exactly one attempt reaches this point per refresh token:
-                // the state flip and the issuance of the new pair are atomic.
-                if (!live.markRotated(insideAt)) {
-                    revokeChain(current, Session.Status.COMPROMISED, insideAt, "concurrent_refresh_token_replay");
-                    logReject("refresh", AuthErrorCode.REFRESH_TOKEN_REPLAY_CONCURRENT, callerId, fid,
-                            live.getState().name(), "lost_atomic_state_flip");
-                    throw new AuthException(AuthErrorCode.REFRESH_TOKEN_REPLAY_CONCURRENT, callerId, fid,
-                            live.getState().name(), "concurrent refresh lost the atomic rotation race");
+            if (live.getExpiresAtMillis() <= insideAt) {
+                logReject("refresh", AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, fid,
+                        live.getState().name(),
+                        "expiresAt=" + live.getExpiresAtMillis() + " now=" + insideAt);
+                throw new AuthException(AuthErrorCode.REFRESH_TOKEN_EXPIRED, callerId, fid,
+                        live.getState().name(), "refresh token expired");
+            }
+
+            // Exactly one attempt reaches this point per refresh token. Build
+            // the successor pair first, then perform the one-shot flip: under
+            // the family lock both effects are visible atomically.
+            TokenPair pair = issuePair(current, insideAt);
+            if (!live.markRotated(insideAt, pair.refreshToken())) {
+                // Defensive: another waiter consumed it between the check and
+                // the flip. Apply the same durable classification.
+                ConflictClassification classification = classifyReuse(live, insideAt);
+                if (!classification.benign()) {
+                    revokeChain(current, Session.Status.COMPROMISED, insideAt,
+                            "sequential_refresh_token_replay");
                 }
-                TokenPair pair = issuePair(current, insideAt);
-                log.info("decision=refresh accepted=true callerId={} familyId={} refreshState=ROTATED "
-                                + "accessState=ISSUED basis=active_token_atomic_rotation attemptId={}",
-                        callerId, fid, attemptId);
-                return pair;
-            });
-        } finally {
-            // Winner releases after the lock is freed and losers have finished
-            // observing the open gate, so concurrent replay is never misclassified.
-            store.releaseFamilyGate(familyId, attemptId);
-        }
+                AuthErrorCode code = classification.benign()
+                        ? AuthErrorCode.REFRESH_CONFLICT_CONCURRENT
+                        : AuthErrorCode.REFRESH_TOKEN_REPLAY_SEQUENTIAL;
+                logReject("refresh", code, callerId, fid, live.getState().name(),
+                        "lost_atomic_state_flip " + classification.basis());
+                throw new AuthException(code, callerId, fid, live.getState().name(),
+                        "lost the atomic rotation race");
+            }
+            log.info("decision=refresh accepted=true callerId={} familyId={} refreshState=ROTATED "
+                            + "accessState=ISSUED basis=active_token_atomic_rotation",
+                    callerId, fid);
+            return pair;
+        });
+    }
+
+    /**
+     * Decide whether reusing an already-consumed token is a benign concurrent
+     * conflict or a genuine sequential replay. Purely a function of durable
+     * state and the logical clock, hence independent of thread scheduling.
+     */
+    private ConflictClassification classifyReuse(RefreshTokenRecord consumed, long at) {
+        long grace = properties.getRefreshConcurrentGraceMillis();
+        boolean withinGrace = at - consumed.getRotatedAtMillis() <= grace;
+        RefreshTokenRecord successor = consumed.getSuccessorRefreshToken() == null
+                ? null : store.findRefreshToken(consumed.getSuccessorRefreshToken());
+        boolean successorFresh = successor != null
+                && successor.getState() == RefreshTokenRecord.State.ACTIVE
+                && successor.getExpiresAtMillis() > at;
+        String basis = "token_already_" + consumed.getState()
+                + " rotatedAt=" + consumed.getRotatedAtMillis() + " now=" + at + " graceMs=" + grace
+                + " withinGrace=" + withinGrace
+                + " successorState=" + (successor == null ? "GONE" : successor.getState());
+        boolean benign = withinGrace && successorFresh;
+        return new ConflictClassification(benign, basis);
+    }
+
+    private record ConflictClassification(boolean benign, String basis) {
     }
 
     /**

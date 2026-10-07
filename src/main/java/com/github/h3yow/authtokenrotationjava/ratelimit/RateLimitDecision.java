@@ -4,6 +4,7 @@ package com.github.h3yow.authtokenrotationjava.ratelimit;
 public record RateLimitDecision(
         boolean allowed,
         String callerId,
+        String scope,
         long requestCountInWindow,
         long windowStartMillis,
         long windowEndMillis,
